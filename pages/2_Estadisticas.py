@@ -15,14 +15,25 @@ st.set_page_config(
     layout="wide"
 )
 
-# --- LÓGICA DE AUTENTICACIÓN (REPETIR EN CADA PÁGINA) ---
-config = st.secrets["config"]
+# --- LÓGICA DE AUTENTICACIÓN ---
+config_secrets = st.secrets["config"]
+
+credentials = {
+    "usernames": {
+        username: {
+            "email": user_data["email"],
+            "name": user_data["name"],
+            "password": user_data["password"]
+        }
+        for username, user_data in config_secrets["credentials"]["usernames"].items()
+    }
+}
 
 authenticator = stauth.Authenticate(
-    config['credentials'],
-    config['cookie']['name'],
-    config['cookie']['key'],
-    config['cookie']['expiry_days']
+    credentials,
+    config_secrets['cookie']['name'],
+    config_secrets['cookie']['key'],
+    config_secrets['cookie']['expiry_days']
 )
 
 authenticator.login()

@@ -18,13 +18,24 @@ st.set_page_config(
 )
 
 # --- LÓGICA DE AUTENTICACIÓN ---
-config = st.secrets["config"]
+config_secrets = st.secrets["config"]
+
+credentials = {
+    "usernames": {
+        username: {
+            "email": user_data["email"],
+            "name": user_data["name"],
+            "password": user_data["password"]
+        }
+        for username, user_data in config_secrets["credentials"]["usernames"].items()
+    }
+}
 
 authenticator = stauth.Authenticate(
-    config['credentials'],
-    config['cookie']['name'],
-    config['cookie']['key'],
-    config['cookie']['expiry_days']
+    credentials,
+    config_secrets['cookie']['name'],
+    config_secrets['cookie']['key'],
+    config_secrets['cookie']['expiry_days']
 )
 
 # Renderiza el widget de login. El resultado puede ser True, False o None.
