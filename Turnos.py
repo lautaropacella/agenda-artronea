@@ -1,25 +1,18 @@
-# app.py
-
 import streamlit as st
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
-from datetime import datetime, time
-# --- NUEVAS LIBRERÍAS ---
+from datetime import datetime, time, timedelta
 import streamlit_authenticator as stauth
-import yaml
-from yaml.loader import SafeLoader
+from google.oauth2.service_account import Credentials
+import gspread
 
 # --- CONFIGURACIÓN DE LA PÁGINA ---
-st.set_page_config(
-    page_title="Agenda de Consultorio",
-    page_icon="🗓️",
-    layout="wide"
-)
+st.set_page_config(page_title="Agenda Semanal", page_icon="🗓️", layout="wide")
+
+# --- DICCIONARIO PARA TRADUCCIÓN DE DÍAS (MÉTODO ROBUSTO) ---
+DIAS_ES = {"Mon": "Lun", "Tue": "Mar", "Wed": "Mié", "Thu": "Jue", "Fri": "Vie", "Sat": "Sáb", "Sun": "Dom"}
 
 # --- LÓGICA DE AUTENTICACIÓN ---
 config_secrets = st.secrets["config"]
-
 credentials = {
     "usernames": {
         username: {
@@ -30,273 +23,175 @@ credentials = {
         for username, user_data in config_secrets["credentials"]["usernames"].items()
     }
 }
-
 authenticator = stauth.Authenticate(
     credentials,
     config_secrets['cookie']['name'],
     config_secrets['cookie']['key'],
     config_secrets['cookie']['expiry_days']
 )
-
-# Renderiza el widget de login. El resultado puede ser True, False o None.
 authenticator.login()
 
+# --- CÓDIGO PRINCIPAL DE LA APLICACIÓN ---
 if st.session_state["authentication_status"]:
-    # --- CONEXIÓN CON GOOGLE SHEETS (SOLO SI ESTÁ AUTENTICADO) ---
+    
+    # --- CONEXIÓN CON GOOGLE SHEETS ---
     @st.cache_resource
     def connect_to_gsheet():
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"], scopes=scopes
-        )
-        client = gspread.authorize(creds)
-        return client
+        scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=scopes)
+        return gspread.authorize(creds)
 
     client = connect_to_gsheet()
-    SPREADSHEET_NAME = "Agenda Consultorio"
-    try:
-        spreadsheet = client.open(SPREADSHEET_NAME)
-        pacientes_sheet = spreadsheet.worksheet("Pacientes")
-        turnos_sheet = spreadsheet.worksheet("Turnos")
-    except gspread.exceptions.SpreadsheetNotFound:
-        st.error(f"No se encontró la planilla '{SPREADSHEET_NAME}'.")
-        st.stop()
+    spreadsheet = client.open("Agenda Consultorio")
+    turnos_sheet = spreadsheet.worksheet("Turnos") # GET THE SHEET OBJECT ONCE
 
     # --- FUNCIONES DE LÓGICA ---
-    @st.cache_data(ttl=600) # Cache por 10 minutos
+    @st.cache_data(ttl=300)
     def cargar_datos(sheet_title):
-        # Obtiene la hoja por su título para un cacheo fiable
-        _sheet = spreadsheet.worksheet(sheet_title)
-        # Usar get_all_values para mayor fiabilidad
-        values = _sheet.get_all_values()
-        if not values:
-            # Si la hoja está completamente vacía, retorna un DataFrame vacío
-            return pd.DataFrame()
-        # La primera fila son las columnas, el resto son los datos
-        return pd.DataFrame(values[1:], columns=values[0])
+        sheet = spreadsheet.worksheet(sheet_title)
+        values = sheet.get_all_values()
+        if not values: return pd.DataFrame()
+        df = pd.DataFrame(values[1:], columns=values[0])
+        if 'Fecha' in df.columns:
+            # FIX: Explicitly handle date formats to ensure correct parsing
+            df['Fecha'] = pd.to_datetime(df['Fecha'], format='mixed', dayfirst=False).dt.date
+        return df
 
-    def guardar_turno(fecha, hora, camilla, paciente, pagado):
-        # Esta función ya no limpia el cache. Se hará de forma centralizada.
-        turnos_df = cargar_datos("Turnos")
+    def guardar_turno(fecha, hora, camilla, paciente, turnos_df, sheet):
         fecha_str = fecha.strftime('%Y-%m-%d')
         hora_str = hora.strftime('%H:%M:%S')
-        # gspread no maneja bien los tipos, mejor comparar como strings
-        mask = (turnos_df['Fecha'] == fecha_str) & \
-               (turnos_df['Hora'] == hora_str) & \
-               (turnos_df['Camilla'] == str(camilla)) # Convertir camilla a string
-        existing_row = turnos_df[mask]
+
+        existing_row = turnos_df[
+            (turnos_df['Fecha'] == fecha) &
+            (turnos_df['Hora'] == hora_str) &
+            (turnos_df['Camilla'] == str(camilla))
+        ]
+
         if not existing_row.empty:
             row_index = existing_row.index[0] + 2
-            if paciente == "Vacante":
-                turnos_sheet.delete_rows(row_index)
+            if paciente == "":
+                sheet.delete_rows(row_index)
             else:
-                # Actualiza tanto el paciente como el estado de pago
-                turnos_sheet.update_cell(row_index, 4, paciente)
-                turnos_sheet.update_cell(row_index, 5, pagado)
-        elif paciente != "Vacante":
-            # Agregar el estado de pago
-            nueva_fila = [fecha_str, hora_str, camilla, paciente, pagado]
-            turnos_sheet.append_row(nueva_fila)
+                sheet.update_cell(row_index, 4, paciente) # Paciente
+        elif paciente != "":
+            sheet.append_row([fecha_str, hora_str, str(camilla), paciente, "No"])
 
-    # --- SIDEBAR (CONSOLIDADA Y CORREGIDA) ---
+    # --- SIDEBAR ---
     with st.sidebar:
         st.write(f"Bienvenido/a *{st.session_state['name']}*")
         authenticator.logout("Cerrar Sesión", "sidebar")
         st.divider()
-        st.header("⚙️ Configuración de Agenda")
-        fecha_seleccionada = st.date_input("Selecciona una fecha", datetime.now())
-        hora_inicio = st.time_input("Hora de Inicio", time(13, 0), step=3600)
+        st.header("⚙️ Configuración de Vista")
+        start_date = st.date_input("Fecha de Inicio", datetime.now().date())
+        end_date = st.date_input("Fecha de Fin", start_date + timedelta(days=4))
+        hora_inicio = st.time_input("Hora de Inicio", time(14, 0), step=3600)
         hora_fin = st.time_input("Hora de Fin", time(20, 0), step=3600)
         num_camillas = 4
 
-    # --- UI DE LA APLICACIÓN ---
-    st.title("🗓️ Agenda del Consultorio")
-    st.markdown("### Vista de turnos por día.")
+    # --- UI PRINCIPAL ---
+    st.title("🗓️ Vista de Turnos por Semana")
 
-    # --- CSS Personalizado para colorear los slots ---
-    st.markdown("""
+    # --- LÓGICA DE DATOS ---
+    pacientes_df = cargar_datos("Pacientes")
+    all_turnos_df = cargar_datos("Turnos")
+
+    # Get a base list of patients marked as "Activo"
+    lista_pacientes_base = sorted(pacientes_df[pacientes_df['Activo'] == 'Sí']['Nombre Completo'].tolist())
+    
+    # Also get a list of all unique patients who have appointments loaded
+    pacientes_en_turnos = all_turnos_df['Paciente'].unique().tolist()
+    
+    # Combine both lists and remove duplicates.
+    pacientes_combinados = sorted(list(set(lista_pacientes_base + pacientes_en_turnos)))
+
+    # Final list for the selectbox (no emoji variants)
+    pacientes_activos = [""] + pacientes_combinados
+
+    date_range = pd.date_range(start=start_date, end=end_date).to_pydatetime()
+    time_slots = pd.date_range(start=datetime.combine(start_date, hora_inicio), end=datetime.combine(start_date, hora_fin), freq='h').time
+
+    # --- CSS PARA SCROLL Y ESTILO (SIMPLIFICADO) ---
+    min_width_px = 150 + (len(time_slots) * 240)
+    st.markdown(f"""
     <style>
-        .slot-container {
-            border-radius: 8px;
-            padding: 10px;
-            margin-bottom: 10px;
-            border: 1px solid #e0e0e0; /* Borde gris claro para la grilla */
-        }
-        .booked-unpaid {
-            background-color: #bbdefb; /* Azul claro - Ocupado, NO pagado */
-        }
-        .booked-paid {
-            background-color: #c8e6c9; /* Verde claro - Ocupado y Pagado */
-        }
-        .vacant-slot {
-            background-color: #ffcdd2; /* Rojo claro - Vacante */
-        }
-        .time-label-container {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 75px; /* Ajusta esta altura para alinear verticalmente */
-        }
-        .time-label-text {
-            font-size: 1.3em; /* Letra más grande */
-            font-weight: bold;
-        }
-        /* El CSS para ocultar ya no es necesario, lo manejaremos con 'disabled' */
+        .header-text {{ font-weight: bold; text-align: center; padding: 5px; }}
+        .day-label {{ font-weight: bold; font-size: 1.2em; padding-top: 20px; text-transform: capitalize; }}
+        div[data-testid="stMain"] > div:first-child {{ overflow-x: auto; }}
+        div[data-testid="stHorizontalBlock"] {{ min-width: {min_width_px}px; }}
+
+        /* --- FIX DEFINITIVO: Remover el borde de las columnas de hora --- */
+        div[data-testid="stVerticalBlock"] > div[style*="flex-direction: column;"] > div[data-testid="stVerticalBlockBorderWrapper"] {{
+            border: none;
+        }}
     </style>
     """, unsafe_allow_html=True)
 
-    # --- DEFINICIÓN DE SLOTS DE TIEMPO ---
-    # Corregido: Cambiar 'H' a 'h' para evitar la advertencia de Pandas.
-    slots_de_tiempo = pd.date_range(
-        start=datetime.combine(fecha_seleccionada, hora_inicio),
-        end=datetime.combine(fecha_seleccionada, hora_fin),
-        freq='h' # Usar 'h' en minúscula
-    )
-
-    # --- LÓGICA DE LISTA DE PACIENTES INTELIGENTE ---
-    pacientes_records = cargar_datos("Pacientes")
-    turnos_del_dia_df = cargar_datos("Turnos")
-    turnos_del_dia_df = turnos_del_dia_df[turnos_del_dia_df['Fecha'] == fecha_seleccionada.strftime('%Y-%m-%d')]
-
-    # 1. Empezar con la lista de pacientes activos
-    pacientes_activos = pacientes_records[pacientes_records['Activo'] == 'Sí']['Nombre Completo'].tolist()
-    lista_pacientes = ["Vacante"] + sorted(pacientes_activos)
-
-    # 2. Añadir cualquier paciente inactivo que ya tenga un turno en el día
-    pacientes_en_agenda_hoy = turnos_del_dia_df['Paciente'].unique()
-    for p in pacientes_en_agenda_hoy:
-        if p != "Vacante" and p not in lista_pacientes:
-            lista_pacientes.append(p)
-
-    # --- FORMULARIO PARA LA AGENDA ---
-    # Volvemos a usar st.form para agrupar los cambios y evitar reloads
-    with st.form(key="agenda_form"):
-        
-        # 1. BOTÓN DE GUARDAR (VISUALMENTE ARRIBA)
+    # --- FORMULARIO DE AGENDA ---
+    with st.form(key="agenda_form_semanal"):
+        # --- BOTÓN DE GUARDADO (MOVIDO ARRIBA) ---
         submitted = st.form_submit_button("💾 Guardar Cambios", type="primary")
-        st.divider()
 
-        # 2. ENCABEZADO DE LA GRILLA
-        cols = st.columns(num_camillas + 1)
-        # Aplica el estilo al contenedor de la hora para el encabezado
-        with cols[0]:
-            st.markdown(
-                """
-                <div class="time-label-container">
-                    <span class="time-label-text">Hora</span>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-        for i, col in enumerate(cols[1:]):
-            with col:
-                st.markdown(
-                    f"""
-                    <div class="time-label-container">
-                        <span class="time-label-text">Camilla {i+1}</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-
-        # 3. GRILLA DE TURNOS
-        for slot in slots_de_tiempo:
-            cols = st.columns(num_camillas + 1)
+        # 1. ENCABEZADO DE HORAS
+        header_cols = st.columns([1] + [3] * len(time_slots))
+        header_cols[0].markdown("") # Espacio para la columna de días
+        for i, t_slot in enumerate(time_slots):
+            header_cols[i+1].markdown(f"<div class='header-text'>{t_slot.strftime('%H:%M')}</div>", unsafe_allow_html=True)
+        
+        # 2. GRILLA DE DÍAS Y HORAS
+        for day in date_range:
+            day_date = day.date()
+            row_cols = st.columns([1] + [3] * len(time_slots))
             
-            # Aplica el estilo al contenedor de la hora
-            with cols[0]:
-                st.markdown(
-                    f"""
-                    <div class="time-label-container">
-                        <span class="time-label-text">{slot.strftime('%H:%M')}</span>
-                    </div>
-                    """,
-                    unsafe_allow_html=True
-                )
-            
-            hora_str = slot.strftime('%H:%M:%S')
+            # Traducción manual del día para evitar errores de encoding
+            eng_day = day_date.strftime('%a')
+            esp_day = DIAS_ES.get(eng_day, eng_day)
+            row_cols[0].markdown(f"<div class='day-label'>{esp_day} {day_date.strftime('%d/%m')}</div>", unsafe_allow_html=True)
 
-            for i in range(1, num_camillas + 1):
-                # Encuentra el paciente y estado de pago para este slot y camilla
-                turno_actual_df = turnos_del_dia_df[
-                    (turnos_del_dia_df['Hora'] == hora_str) &
-                    (turnos_del_dia_df['Camilla'] == str(i))
-                ]
-                paciente_actual = turno_actual_df['Paciente'].iloc[0] if not turno_actual_df.empty else "Vacante"
-                pagado_actual = True if not turno_actual_df.empty and turno_actual_df['Pagado'].iloc[0] == 'Sí' else False
+            for i, t_slot in enumerate(time_slots):
+                with row_cols[i+1]:
+                    for camilla_num in range(1, num_camillas + 1):
+                        turno_actual_df = all_turnos_df[
+                            (all_turnos_df['Fecha'] == day_date) &
+                            (all_turnos_df['Hora'] == t_slot.strftime('%H:%M:%S')) &
+                            (all_turnos_df['Camilla'] == str(camilla_num))
+                        ]
 
-                # Determina el estilo basado en si está vacante o no
-                if paciente_actual == "Vacante":
-                    slot_class = "vacant-slot"
-                else:
-                    slot_class = "booked-paid" if pagado_actual else "booked-unpaid"
+                        if not turno_actual_df.empty:
+                            paciente_actual = turno_actual_df['Paciente'].iloc[0]
+                        else:
+                            paciente_actual = ""
 
+                        status_emoji = "🟢" if paciente_actual == "" else "🔴"
 
-                with cols[i]:
-                    # Envuelve el selector en un div con la clase CSS correspondiente
-                    st.markdown(f'<div class="slot-container {slot_class}">', unsafe_allow_html=True)
-                    
-                    # Columnas internas para selector y checkbox
-                    c1, c2 = st.columns([3, 1])
-
-                    with c1:
+                        # Original selectbox with combined label
                         st.selectbox(
-                            label="paciente_selector",
-                            label_visibility="collapsed",
-                            options=lista_pacientes,
-                            index=lista_pacientes.index(paciente_actual),
-                            key=f"pac_{fecha_seleccionada}-{hora_str}-{i}"
+                            label=f"{status_emoji} C{camilla_num}",
+                            options=pacientes_activos,
+                            index=pacientes_activos.index(paciente_actual) if paciente_actual in pacientes_activos else 0,
+                            key=f"pac_{day_date}_{t_slot}_{camilla_num}",
                         )
-                    
-                    with c2:
-                        st.checkbox(
-                            label="P", 
-                            value=pagado_actual, 
-                            key=f"pag_{fecha_seleccionada}-{hora_str}-{i}",
-                            help="Pagado"
-                        )
-                    
-                    st.markdown('</div>', unsafe_allow_html=True)
+            st.divider()
 
-    # 4. LÓGICA DE GUARDADO (SE EJECUTA FUERA DEL FORMULARIO, DESPUÉS DE ENVIAR)
+    # --- LÓGICA DE GUARDADO (CORREGIDA) ---
     if submitted:
-        with st.spinner("Guardando cambios en la planilla..."):
-            # Itera sobre cada slot para ver si hubo cambios
-            for slot in slots_de_tiempo:
-                hora_str = slot.strftime('%H:%M:%S')
-                for i in range(1, num_camillas + 1):
-                    # Reconstruye las claves para obtener los valores del estado de la sesión
-                    pac_key = f"pac_{fecha_seleccionada}-{hora_str}-{i}"
-                    pag_key = f"pag_{fecha_seleccionada}-{hora_str}-{i}"
-                    
-                    paciente_seleccionado = st.session_state[pac_key]
-                    
-                    # Si el turno seleccionado es "Vacante", el pago debe ser Falso.
-                    if paciente_seleccionado == "Vacante":
-                        pagado_seleccionado = False
-                    else:
-                        pagado_seleccionado = st.session_state.get(pag_key, False)
+        with st.spinner("Guardando cambios..."):
+            for day in date_range:
+                day_date = day.date()
+                for t_slot in time_slots:
+                    for camilla_num in range(1, num_camillas + 1):
+                        paciente_seleccionado = st.session_state[f"pac_{day_date}_{t_slot}_{camilla_num}"]
+                        guardar_turno(
+                            day_date,
+                            t_slot,
+                            camilla_num,
+                            paciente_seleccionado,
+                            all_turnos_df,
+                            turnos_sheet,
+                        )
 
-                    # Obtiene el valor original de la base de datos
-                    turno_original_df = turnos_del_dia_df[
-                        (turnos_del_dia_df['Hora'] == hora_str) &
-                        (turnos_del_dia_df['Camilla'] == str(i))
-                    ]
-                    paciente_original = turno_original_df['Paciente'].iloc[0] if not turno_original_df.empty else "Vacante"
-                    pagado_original = True if not turno_original_df.empty and turno_original_df['Pagado'].iloc[0] == 'Sí' else False
-
-                    # Si el valor ha cambiado, lo guarda
-                    if paciente_seleccionado != paciente_original or pagado_seleccionado != pagado_original:
-                        pagado_str = "Sí" if pagado_seleccionado else "No"
-                        guardar_turno(fecha_seleccionada, slot, i, paciente_seleccionado, pagado_str)
-            
-            # Limpia el cache y recarga la página para reflejar los cambios guardados
-            st.cache_data.clear()
-            st.success("¡Cambios guardados con éxito!")
-            st.rerun()
+        st.cache_data.clear()
+        st.success("¡Cambios guardados con éxito!")
+        st.rerun()
 
 elif st.session_state["authentication_status"] is False:
     st.error('Usuario/contraseña incorrectos')
